@@ -1,0 +1,187 @@
+@https_fn.on_request()
+def pesapal_payment(req: https_fn.Request) -> https_fn.Response:
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+    }
+
+    if req.method == "OPTIONS":
+        return https_fn.Response("", headers=headers, status=204)
+    if req.method != "POST":
+        return https_fn.Response("Method not allowed", headers=headers, status=405)
+
+    try:
+        data = req.get_json()
+        print("🔹 Incoming data:", data, file=sys.stderr)
+
+        # 🔹 CASE 1: If Pesapal is calling back with order_tracking_id → Handle callback/status check
+        if "order_tracking_id" in data:
+            order_tracking_id = data.get("order_tracking_id")
+            merchant_reference = data.get("order_reference")
+
+            if not order_tracking_id:
+                return https_fn.Response(
+                    json.dumps({"error": "Missing order_tracking_id"}),
+                    headers=headers,
+                    status=400,
+                )
+
+            # 1. Get OAuth2 token
+            token_resp = requests.post(
+                f"{PESAPAL_BASE_URL}/Auth/RequestToken",
+                json={
+                    "consumer_key": PESAPAL_CONSUMER_KEY,
+                    "consumer_secret": PESAPAL_CONSUMER_SECRET,
+                },
+            )
+            token_resp.raise_for_status()
+            access_token = token_resp.json()["token"]
+
+            # 2. Query transaction status
+            status_resp = requests.get(
+                f"{PESAPAL_BASE_URL}/Transactions/GetTransactionStatus?orderTrackingId={order_tracking_id}",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            status_resp.raise_for_status()
+            status_data = status_resp.json()
+
+            print("🔹 Transaction status:", status_data, file=sys.stderr)
+
+            result = {
+                "order_reference": merchant_reference,
+                "order_tracking_id": order_tracking_id,
+                "status": status_data.get("status"),
+                "payment_method": status_data.get("payment_method"),
+                "amount": status_data.get("amount"),
+                "currency": status_data.get("currency"),
+                "payment_account": status_data.get("payment_account"),
+                "transaction_date": status_data.get("created_date"),
+            }
+
+          
+            callback_url = data.get("callback_url") 
+            redirect_url = (
+                f"{callback_url}?OrderTrackingId={order_tracking_id}"
+                f"&OrderMerchantReference={merchant_reference}"
+                f"&status={result['status']}"
+                f"&amount={result['amount']}"
+            )
+
+            return https_fn.Response(
+                json.dumps({"message": "Payment processed", "result": result, "redirect_url": redirect_url}),
+                headers=headers,
+                status=200,
+            )
+
+        # 🔹 CASE 2: Otherwise → This is the frontend requesting to create an order
+        callback_url = data.get("callback_url")
+        if not callback_url:
+            return https_fn.Response(
+                json.dumps({"error": "Missing callback URL"}),
+                headers=headers,
+                status=400,
+            )
+
+        amount = data.get("amount")
+        purpose = data.get("description")  # purpose is "description" in payload
+        billing_address = data.get("billing_address", {})
+        email = billing_address.get("email_address")
+        phone = billing_address.get("phone_number")
+
+        name_parts = [
+            billing_address.get("first_name"),
+            billing_address.get("middle_name"),
+            billing_address.get("last_name"),
+        ]
+        name = " ".join([p for p in name_parts if p])
+
+        if not all([amount, phone, name]):
+            return https_fn.Response(
+                json.dumps({"error": "Missing required fields"}),
+                headers=headers,
+                status=400,
+            )
+
+        # ✅ Split names
+        name_parts = name.split(" ", 2)
+        first_name = name_parts[0]
+        middle_name = name_parts[1] if len(name_parts) > 2 else ""
+        last_name = name_parts[-1] if len(name_parts) > 1 else ""
+
+        # 1. Get OAuth2 token
+        token_resp = requests.post(
+            f"{PESAPAL_BASE_URL}/Auth/RequestToken",
+            json={
+                "consumer_key": PESAPAL_CONSUMER_KEY,
+                "consumer_secret": PESAPAL_CONSUMER_SECRET,
+            },
+        )
+        print("🔹 Pesapal token response:", token_resp.text, file=sys.stderr)
+        token_resp.raise_for_status()
+        token_data = token_resp.json()
+
+        if "token" not in token_data:
+            return https_fn.Response(
+                json.dumps({"error": "Failed to get token", "response": token_data}),
+                headers=headers,
+                status=400,
+            )
+
+        access_token = token_data["token"]
+
+        # 2. Build order payload
+        order_payload = {
+            "id": str(uuid.uuid4()),
+            "currency": "UGX",
+            "amount": float(amount),
+            "description": purpose or "Payment",
+            "callback_url": callback_url,
+            "redirect_mode": "",
+            "notification_id": PESAPAL_IPN_ID,
+            "branch": "Main Branch",
+            "billing_address": {
+                "email_address": email,
+                "phone_number": phone,
+                "country_code": "UG",
+                "first_name": first_name,
+                "middle_name": middle_name,
+                "last_name": last_name,
+                "line_1": "Your Business Name",
+                "line_2": "",
+                "city": "Kampala",
+                "state": "",
+                "postal_code": "",
+                "zip_code": "",
+            },
+        }
+
+        print("🔹 Sending order payload:", json.dumps(order_payload), file=sys.stderr)
+
+        order_resp = requests.post(
+            f"{PESAPAL_BASE_URL}/Transactions/SubmitOrderRequest",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            json=order_payload,
+        )
+        print("🔹 Pesapal order response:", order_resp.text, file=sys.stderr)
+        order_resp.raise_for_status()
+
+        order_data = order_resp.json()
+        payment_url = order_data.get("redirect_url")
+
+        return https_fn.Response(
+            json.dumps({"payment_url": payment_url}),
+            headers=headers,
+            status=200,
+        )
+
+    except Exception as e:
+        print("❌ Pesapal payment error:", str(e), file=sys.stderr)
+        return https_fn.Response(
+            json.dumps({"error": str(e)}),
+            headers=headers,
+            status=400,
+        )
